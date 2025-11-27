@@ -33,9 +33,9 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 200
+eval_interval = 100
 log_interval = 1
-eval_iters = 200
+eval_iters = 30
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -52,17 +52,18 @@ block_size = 1024 # context of up to 256 previous characters
 n_layer = 6
 n_head = 6
 n_embd = 384
-dropout = 0.2
+dropout = 0.4
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
-max_iters = 5000
-lr_decay_iters = 5000 # make equal to max_iters usually
-weight_decay=0.1
+max_iters = 2000
+lr_decay_iters = 1900
+weight_decay=0.2
 min_lr = 1e-4 # learning_rate / 10 usually
 beta1 = 0.9
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+lr_schedule = "cosine"
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 100 # how many steps to warm up for
@@ -71,7 +72,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -227,19 +228,22 @@ def estimate_loss():
     model.train()
     return out
 
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+
+if (lr_schedule=="wsd"):
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer,start_factor=1e-10,end_factor=1, total_iters=warmup_iters)
+    hold_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer,factor=1, total_iters=max_iters-lr_decay_iters-warmup_iters)
+    decay_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer,start_factor=1,end_factor=min_lr/learning_rate,total_iters=max_iters-lr_decay_iters)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, hold_scheduler, decay_scheduler],
+                                            milestones=[warmup_iters, lr_decay_iters])
+elif (lr_schedule == "cosine"):
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer,start_factor=1e-10,end_factor=1,total_iters=warmup_iters)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=max_iters - warmup_iters, eta_min=min_lr)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_iters])
+
+elif (lr_schedule == "steplr"):
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.5)
+
+
 
 # logging
 if swanlab_log and master_process:
@@ -254,12 +258,6 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
-
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
@@ -269,7 +267,7 @@ while True:
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
-                "lr": lr,
+                "lr": optimizer.param_groups[0]["lr"],
                 "mfu": running_mfu*100, # convert to percentage
                 "allocated_mem": torch.cuda.memory_allocated(0)/1024**2,
             })
@@ -311,10 +309,10 @@ while True:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
+    scheduler.step()
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
-
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
